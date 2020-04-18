@@ -9,7 +9,7 @@
 #include <vector>
 
 #include <arrayfire.h>
-#include <mkldnn.h>
+#include <dnnl.h>
 
 #include "flashlight/autograd/Functions.h"
 #include "flashlight/autograd/Utils.h"
@@ -17,7 +17,7 @@
 #include "flashlight/autograd/backend/cpu/MkldnnUtils.h"
 #include "flashlight/common/DevicePtr.h"
 
-using namespace mkldnn;
+using namespace dnnl;
 
 namespace {
 
@@ -59,11 +59,11 @@ Variable pool2d(
                                      output.dims(kWIdx)});
   memory::dims windowDims = {wy, wx};
   memory::dims strideDims = {sy, sx};
-  std::vector<int> paddingDims = {py, px};
+  memory::dims paddingDims = {py, px};
 
   auto dataType = detail::mkldnnMapToType(input.type());
-  auto formatNCHW = memory::format::nchw;
-  auto formatAny = memory::format::any;
+  auto formatNCHW = memory::format_tag::nchw;
+  auto formatAny = memory::format_tag::any;
 
   // Memory desc
   auto inputMD = memory::desc({inputDims}, dataType, formatNCHW);
@@ -72,15 +72,15 @@ Variable pool2d(
   // Memory
   auto mkldnnEngine = detail::MkldnnEngine::getInstance().getEngine();
   DevicePtr inputRaw(input.array());
-  auto inputMemoryInit = memory(
-      {{{inputDims}, dataType, formatNCHW}, mkldnnEngine}, inputRaw.get());
+  auto inputMemoryInit =
+      memory({{inputDims}, dataType, formatNCHW}, mkldnnEngine, inputRaw.get());
   DevicePtr outputRaw(output);
   auto outputMemoryInit = memory(
-      {{{outputDims}, dataType, formatNCHW}, mkldnnEngine}, outputRaw.get());
+      {{outputDims}, dataType, formatNCHW}, mkldnnEngine, outputRaw.get());
 
   // Choose a mode based on whether gradients are needed
-  auto forwardMode =
-      input.isCalcGrad() ? prop_kind::forward : prop_kind::forward_inference;
+  auto forwardMode = input.isCalcGrad() ? prop_kind::forward_training
+                                        : prop_kind::forward_inference;
 
   // Descriptors
   auto poolingMode = detail::mkldnnMapToPoolingMode(mode);
@@ -92,42 +92,47 @@ Variable pool2d(
       strideDims,
       windowDims,
       paddingDims,
-      paddingDims,
-      padding_kind::zero);
+      paddingDims);
   auto primDesc = pooling_forward::primitive_desc(desc, mkldnnEngine);
 
   // Network
   std::vector<primitive> network;
   // Reorder if needed
-  auto inputPrimDesc = primDesc.src_primitive_desc();
-  auto outputPrimDesc = primDesc.dst_primitive_desc();
+  auto inputPrimDesc = primDesc.src_desc();
+  auto outputPrimDesc = primDesc.dst_desc();
   auto inputMemory =
       detail::mkldnnAlignOrdering(network, inputMemoryInit, inputPrimDesc);
   auto outputMemory = outputMemoryInit;
-  if (outputMemoryInit.get_primitive_desc() !=
-      memory::primitive_desc(outputPrimDesc)) {
-    outputMemory = memory(outputPrimDesc);
+  if (outputMemoryInit.get_desc() != outputPrimDesc) {
+    outputMemory = memory(outputPrimDesc, mkldnnEngine);
   }
   // Workspace and layer (only training mode requires a workspace)
   std::shared_ptr<memory> workspaceMemory; // no default ctors
   std::shared_ptr<pooling_forward> pooling;
+  pooling = std::make_shared<pooling_forward>(primDesc);
+
+  std::unordered_map<int, dnnl::memory> input_args;
+  input_args.insert({DNNL_ARG_SRC, inputMemory});
+  input_args.insert({DNNL_ARG_DST, outputMemory});
+
   if (input.isCalcGrad()) {
-    workspaceMemory =
-        std::make_shared<memory>(primDesc.workspace_primitive_desc());
-    pooling = std::make_shared<pooling_forward>(
-        primDesc, inputMemory, outputMemory, *workspaceMemory);
-  } else {
-    pooling =
-        std::make_shared<pooling_forward>(primDesc, inputMemory, outputMemory);
+    workspaceMemory = std::make_shared<memory>(primDesc.workspace_desc(), mkldnnEngine);
+    input_args.insert({DNNL_ARG_WORKSPACE, *workspaceMemory});
   }
+
   network.push_back(*pooling);
 
   // Add output reordering if needed
-  if (outputMemory != outputMemoryInit) {
-    network.push_back(mkldnn::reorder(outputMemory, outputMemoryInit));
+  if (outputMemory.get_desc() != outputMemoryInit.get_desc()) {
+    network.push_back(dnnl::reorder(outputMemory, outputMemoryInit));
   }
 
-  detail::MkldnnStream::getInstance().getStream().submit(network);
+  for (size_t i = 0; i < network.size(); ++i) {
+    network.at(i).execute(
+        detail::MkldnnStream::getInstance().getStream(), input_args);
+  }
+
+  pooling->execute(detail::MkldnnStream::getInstance().getStream(), input_args);
 
   auto gradFunc =
       [dataType,
@@ -159,18 +164,20 @@ Variable pool2d(
         // Memory
         DevicePtr gradInputRaw(gradInput.array());
         auto gradInputMemoryInit = memory(
-            {{{inputDims}, dataType, formatNCHW}, mkldnnEngineBwd},
+            {{inputDims}, dataType, formatNCHW},
+            mkldnnEngineBwd,
             gradInputRaw.get());
         DevicePtr gradOutputRaw(grad_output.array());
         auto gradOutputMemoryInit = memory(
-            {{{outputDims}, dataType, formatNCHW}, mkldnnEngineBwd},
+            {{outputDims}, dataType, formatNCHW},
+            mkldnnEngineBwd,
             gradOutputRaw.get());
 
         // Descriptors
         // Memory descriptors from initialized memory must be used since
         // pooling_backward descriptors require an ordering
-        auto gradInputMD = gradInputMemoryInit.get_primitive_desc().desc();
-        auto gradOutputMD = gradOutputMemoryInit.get_primitive_desc().desc();
+        auto gradInputMD = gradInputMemoryInit.get_desc();
+        auto gradOutputMD = gradOutputMemoryInit.get_desc();
         auto bwdDesc = pooling_backward::desc(
             poolingMode,
             gradInputMD,
@@ -178,8 +185,7 @@ Variable pool2d(
             strideDims,
             windowDims,
             paddingDims,
-            paddingDims,
-            padding_kind::zero);
+            paddingDims);
         // Pass forward descriptor as a hint
         auto bwdPrimDesc = pooling_backward::primitive_desc(
             bwdDesc, mkldnnEngineBwd, primDesc);
@@ -187,19 +193,20 @@ Variable pool2d(
         std::vector<primitive> networkBackward;
         // Reorder output memory if required
         auto gradOutputMemory = detail::mkldnnAlignOrdering(
-            networkBackward,
-            gradOutputMemoryInit,
-            outputMemory.get_primitive_desc());
+            networkBackward, gradOutputMemoryInit, outputMemory.get_desc());
 
-        auto poolBwd = pooling_backward(
-            bwdPrimDesc,
-            gradOutputMemory,
-            *workspaceMemory, // workspace memory from forward
-            gradInputMemoryInit);
+        std::unordered_map<int, dnnl::memory> input_args;
+        input_args.insert({DNNL_ARG_DIFF_SRC, gradInputMemoryInit});
+        input_args.insert({DNNL_ARG_DIFF_DST, gradOutputMemory});
+        input_args.insert({DNNL_ARG_WORKSPACE, *workspaceMemory});
+
+        auto poolBwd = pooling_backward(bwdPrimDesc);
         networkBackward.push_back(poolBwd);
 
-        detail::MkldnnStream::getInstance().getStream().submit(networkBackward);
-
+        for (size_t i = 0; i < networkBackward.size(); ++i) {
+          networkBackward.at(i).execute(
+              detail::MkldnnStream::getInstance().getStream(), input_args);
+        }
         in.addGrad(gradInput);
       };
 

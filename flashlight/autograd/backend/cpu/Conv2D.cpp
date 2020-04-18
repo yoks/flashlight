@@ -11,14 +11,14 @@
 #include <vector>
 
 #include <arrayfire.h>
-#include <mkldnn.hpp>
+#include <dnnl.hpp>
 
 #include "flashlight/autograd/Functions.h"
 #include "flashlight/autograd/Variable.h"
 #include "flashlight/autograd/backend/cpu/MkldnnUtils.h"
 #include "flashlight/common/DevicePtr.h"
 
-using namespace mkldnn;
+using namespace dnnl;
 
 namespace fl {
 
@@ -83,13 +83,13 @@ Variable conv2d(
   auto dataType = detail::mkldnnMapToType(input.type());
   // Use memory::format::any for memory formatting even if convolution inputs
   // are shaped a particular way.
-  auto formatAny = memory::format::any;
+  auto formatAny = memory::format_tag::any;
   // MKL-DNN convention is to always shape the input and output as NHWC and
   // weights as HWIO regardless of the actual data shape. One cannot create a
   // convolution descriptor with other formatting options.
-  auto formatNCHW = memory::format::nchw;
+  auto formatNCHW = memory::format_tag::nchw;
   auto formatWeight =
-      (groups == 1) ? memory::format::oihw : memory::format::goihw;
+      (groups == 1) ? memory::format_tag::oihw : memory::format_tag::goihw;
 
   /********************************* Forward *******************************/
   // Create memory dims
@@ -143,7 +143,7 @@ Variable conv2d(
   if (hasBias) {
     fwdDescriptor = std::make_shared<convolution_forward::desc>(
         forwardMode,
-        convolution_direct,
+        dnnl::algorithm::convolution_direct,
         inputMD,
         weightMD,
         biasMD,
@@ -151,20 +151,18 @@ Variable conv2d(
         mStrideDims,
         mDilationDims,
         mPaddingDims,
-        mPaddingDims,
-        padding_kind::zero);
+        mPaddingDims);
   } else {
     fwdDescriptor = std::make_shared<convolution_forward::desc>(
         forwardMode,
-        convolution_direct,
+        dnnl::algorithm::convolution_direct,
         inputMD,
         weightMD,
         outputMD,
         mStrideDims,
         mDilationDims,
         mPaddingDims,
-        mPaddingDims,
-        padding_kind::zero);
+        mPaddingDims);
   }
 
   // Primitive descriptor
@@ -175,14 +173,13 @@ Variable conv2d(
   // Create memory
   DevicePtr inputRaw(input.array());
   auto inputMemoryInit = memory(
-      {{{mInputDims}, dataType, formatNCHW}, mkldnnEngine}, inputRaw.get());
+      {{mInputDims}, dataType, formatNCHW}, mkldnnEngine, inputRaw.get());
   DevicePtr outputRaw(output);
   auto outputMemoryInit = memory(
-      {{{mOutputDims}, dataType, formatNCHW}, mkldnnEngine}, outputRaw.get());
+      {{mOutputDims}, dataType, formatNCHW}, mkldnnEngine, outputRaw.get());
   DevicePtr weightsRaw(weights.array());
   auto weightsMemoryInit = memory(
-      {{{mWeightDims}, dataType, formatWeight}, mkldnnEngine},
-      weightsRaw.get());
+      {{mWeightDims}, dataType, formatWeight}, mkldnnEngine, weightsRaw.get());
 
   // Network for execution
   std::vector<primitive> network;
@@ -190,9 +187,9 @@ Variable conv2d(
   // is different from NCHW/OIHW (even if specified), and reordering if
   // necessary, since the convolution itself may request a different
   // ordering
-  auto inputPrimDesc = fwdPrimDesc->src_primitive_desc();
-  auto weightsPrimDesc = fwdPrimDesc->weights_primitive_desc();
-  auto outputPrimDesc = fwdPrimDesc->dst_primitive_desc();
+  auto inputPrimDesc = fwdPrimDesc->src_desc();
+  auto weightsPrimDesc = fwdPrimDesc->weights_desc();
+  auto outputPrimDesc = fwdPrimDesc->dst_desc();
   // Input
   auto inputMemory =
       detail::mkldnnAlignOrdering(network, inputMemoryInit, inputPrimDesc);
@@ -200,32 +197,39 @@ Variable conv2d(
       detail::mkldnnAlignOrdering(network, weightsMemoryInit, weightsPrimDesc);
   // Output - adds a reorder after the conv if needed
   auto outputMemory = outputMemoryInit;
-  if (outputMemoryInit.get_primitive_desc() !=
-      memory::primitive_desc(outputPrimDesc)) {
-    outputMemory = memory(outputPrimDesc);
+  if (outputMemoryInit.get_desc() != outputPrimDesc) {
+    outputMemory = memory(outputPrimDesc, mkldnnEngine);
   }
 
   // Create convolution
   std::shared_ptr<convolution_forward> conv;
   DevicePtr biasRaw(bias.array());
-  auto formatBias = memory::format::x;
-  auto biasMemory = memory(
-      {{{mBiasDims}, dataType, formatBias}, mkldnnEngine}, biasRaw.get());
+  auto formatBias = memory::format_tag::x;
+  auto biasMemory =
+      memory({{mBiasDims}, dataType, formatBias}, mkldnnEngine, biasRaw.get());
+
+  std::unordered_map<int, dnnl::memory> input_args;
+  input_args.insert({DNNL_ARG_SRC, inputMemory});
+  input_args.insert({DNNL_ARG_DST, outputMemory});
+  input_args.insert({DNNL_ARG_WEIGHTS, weightsMemory});
+
+  conv = std::make_shared<convolution_forward>(*fwdPrimDesc);
+
   if (hasBias) {
-    conv = std::make_shared<convolution_forward>(
-        *fwdPrimDesc, inputMemory, weightsMemory, biasMemory, outputMemory);
-  } else {
-    conv = std::make_shared<convolution_forward>(
-        *fwdPrimDesc, inputMemory, weightsMemory, outputMemory);
+    input_args.insert({DNNL_ARG_BIAS, biasMemory});
   }
+
   network.push_back(*conv);
 
   // Add output reordering if needed
-  if (outputMemory != outputMemoryInit) {
-    network.push_back(mkldnn::reorder(outputMemory, outputMemoryInit));
+  if (outputMemory.get_desc() != outputMemoryInit.get_desc()) {
+    network.push_back(dnnl::reorder(outputMemory, outputMemoryInit));
   }
 
-  detail::MkldnnStream::getInstance().getStream().submit(network);
+  for (size_t i = 0; i < network.size(); ++i) {
+    network.at(i).execute(
+        detail::MkldnnStream::getInstance().getStream(), input_args);
+  }
 
   /***************************** Backward ******************************/
   auto gradFunc = [hasBias,
@@ -261,15 +265,14 @@ Variable conv2d(
 
       // Backward descriptor
       auto bwdDataDesc = std::make_shared<convolution_backward_data::desc>(
-          convolution_direct,
+          dnnl::algorithm::convolution_direct,
           inputMD,
           weightMD,
           outputMD,
           mStrideDims,
           mDilationDims,
           mPaddingDims,
-          mPaddingDims,
-          padding_kind::zero);
+          mPaddingDims);
       // Primitive descriptor
       auto bwdDataPrimDesc =
           std::make_shared<convolution_backward_data::primitive_desc>(
@@ -278,47 +281,54 @@ Variable conv2d(
       // Create memory
       DevicePtr gradOutputRaw(grad_output.array());
       auto gradOutputMemoryInit = memory(
-          {{{mOutputDims}, dataType, formatNCHW}, mkldnnEngineBwd},
+          {{mOutputDims}, dataType, formatNCHW},
+          mkldnnEngineBwd,
           gradOutputRaw.get());
       DevicePtr gradInputRaw(gradInput.array());
       auto gradInputMemoryInit = memory(
-          {{{mInputDims}, dataType, formatNCHW}, mkldnnEngineBwd},
+          {{mInputDims}, dataType, formatNCHW},
+          mkldnnEngineBwd,
           gradInputRaw.get());
       DevicePtr weightRaw(weightRef.array());
       auto weightsMemoryInitBackwards = memory(
-          {{{mWeightDims}, dataType, formatWeight}, mkldnnEngineBwd},
+          {{mWeightDims}, dataType, formatWeight},
+          mkldnnEngineBwd,
           weightRaw.get());
 
       std::vector<primitive> networkBackwards;
       // Check for reorderings
-      auto gradOutputPrimitiveDesc = bwdDataPrimDesc->diff_dst_primitive_desc();
-      auto weightsPrimitiveDesc = bwdDataPrimDesc->weights_primitive_desc();
-      auto gradInputPrimitiveDesc = bwdDataPrimDesc->diff_src_primitive_desc();
+      auto gradOutputPrimitiveDesc = bwdDataPrimDesc->diff_dst_desc();
+      auto weightsPrimitiveDesc = bwdDataPrimDesc->weights_desc();
+      auto gradInputPrimitiveDesc = bwdDataPrimDesc->diff_src_desc();
       auto gradOutputMemory = detail::mkldnnAlignOrdering(
           networkBackwards, gradOutputMemoryInit, gradOutputPrimitiveDesc);
       auto weightsMemoryBackwards = detail::mkldnnAlignOrdering(
           networkBackwards, weightsMemoryInitBackwards, weightsPrimitiveDesc);
       auto gradInputMemory = gradInputMemoryInit;
       // Don't reorder the gradient until after the conv
-      if (gradInputMemoryInit.get_primitive_desc() !=
-          memory::primitive_desc(gradInputPrimitiveDesc)) {
-        gradInputMemory = memory(gradInputPrimitiveDesc);
+      if (gradInputMemoryInit.get_desc() != gradInputPrimitiveDesc) {
+        gradInputMemory = memory(gradInputPrimitiveDesc, mkldnnEngineBwd);
       }
 
       // Convolution backwards
-      auto convBwdData = std::make_shared<convolution_backward_data>(
-          *bwdDataPrimDesc,
-          gradOutputMemory,
-          weightsMemoryBackwards,
-          gradInputMemory);
+      auto convBwdData =
+          std::make_shared<convolution_backward_data>(*bwdDataPrimDesc);
       networkBackwards.push_back(*convBwdData);
 
-      detail::MkldnnStream::getInstance().getStream().submit(networkBackwards);
+      std::unordered_map<int, dnnl::memory> input_args;
+      input_args.insert({DNNL_ARG_DIFF_SRC, gradInputMemory});
+      input_args.insert({DNNL_ARG_DIFF_DST, gradOutputMemory});
+      input_args.insert({DNNL_ARG_WEIGHTS, weightsMemoryBackwards});
+
+      for (size_t i = 0; i < networkBackwards.size(); ++i) {
+        networkBackwards.at(i).execute(
+            detail::MkldnnStream::getInstance().getStream(), input_args);
+      }
 
       // Reorder the output (which is gradInput here) if necessary
-      if (gradInputMemory != gradInputMemoryInit) {
+      if (gradInputMemory.get_desc() != gradInputMemoryInit.get_desc()) {
         networkBackwards.push_back(
-            mkldnn::reorder(gradInputMemory, gradInputMemoryInit));
+            dnnl::reorder(gradInputMemory, gradInputMemoryInit));
       }
 
       inputRef.addGrad(gradInput);
@@ -340,7 +350,7 @@ Variable conv2d(
       std::shared_ptr<convolution_backward_weights::desc> bwdWeightDesc;
       if (hasBias) {
         bwdWeightDesc = std::make_shared<convolution_backward_weights::desc>(
-            convolution_direct,
+            dnnl::algorithm::convolution_direct,
             inputMD,
             weightMD,
             biasMD,
@@ -348,19 +358,17 @@ Variable conv2d(
             mStrideDims,
             mDilationDims,
             mPaddingDims,
-            mPaddingDims,
-            padding_kind::zero);
+            mPaddingDims);
       } else {
         bwdWeightDesc = std::make_shared<convolution_backward_weights::desc>(
-            convolution_direct,
+            dnnl::algorithm::convolution_direct,
             inputMD,
             weightMD,
             outputMD,
             mStrideDims,
             mDilationDims,
             mPaddingDims,
-            mPaddingDims,
-            padding_kind::zero);
+            mPaddingDims);
       }
       // Weight backward primitive descriptor
       auto bwdWeightPrimDesc =
@@ -370,65 +378,66 @@ Variable conv2d(
       // Create memory
       DevicePtr inputRawBackwards(inputRef.array());
       auto inputMemoryInitBackwards = memory(
-          {{{mInputDims}, dataType, formatNCHW}, mkldnnEngineBwd},
+          {{mInputDims}, dataType, formatNCHW},
+          mkldnnEngineBwd,
           inputRawBackwards.get());
       DevicePtr gradOutputRaw(grad_output.array());
       auto gradOutputMemoryInit = memory(
-          {{{mOutputDims}, dataType, formatNCHW}, mkldnnEngineBwd},
+          {{mOutputDims}, dataType, formatNCHW},
+          mkldnnEngineBwd,
           gradOutputRaw.get());
       DevicePtr gradWeightsRaw(gradWeights.array());
       auto gradWeightsMemoryInit = memory(
-          {{{mWeightDims}, dataType, formatWeight}, mkldnnEngineBwd},
+          {{mWeightDims}, dataType, formatWeight},
+          mkldnnEngineBwd,
           gradWeightsRaw.get());
 
       std::vector<primitive> networkBackwards;
       // Check for reorderings, reorder if needed
-      auto inputPrimitiveDesc = bwdWeightPrimDesc->src_primitive_desc();
-      auto gradOutputPrimitiveDesc =
-          bwdWeightPrimDesc->diff_dst_primitive_desc();
-      auto gradWeightsPrimitiveDesc =
-          bwdWeightPrimDesc->diff_weights_primitive_desc();
+      auto inputPrimitiveDesc = bwdWeightPrimDesc->src_desc();
+      auto gradOutputPrimitiveDesc = bwdWeightPrimDesc->diff_dst_desc();
+      auto gradWeightsPrimitiveDesc = bwdWeightPrimDesc->diff_weights_desc();
       auto inputMemoryBackwards = detail::mkldnnAlignOrdering(
           networkBackwards, inputMemoryInitBackwards, inputPrimitiveDesc);
       auto gradOutputMemory = detail::mkldnnAlignOrdering(
           networkBackwards, gradOutputMemoryInit, gradOutputPrimitiveDesc);
       // Don't reorder the grads until after the conv bwd
       auto gradWeightsMemory = gradWeightsMemoryInit;
-      if (gradWeightsMemoryInit.get_primitive_desc() !=
-          memory::primitive_desc(gradWeightsPrimitiveDesc)) {
-        gradWeightsMemory = memory(gradWeightsPrimitiveDesc);
+      if (gradWeightsMemoryInit.get_desc() != gradWeightsPrimitiveDesc) {
+        gradWeightsMemory = memory(gradWeightsPrimitiveDesc, mkldnnEngineBwd);
       }
 
       // Create the convolution backward weight
       std::shared_ptr<convolution_backward_weights> bwdWeights;
       DevicePtr biasRawBackwards(gradBias.array());
-      auto formatBias = memory::format::x;
+      auto formatBias = memory::format_tag::x;
       auto gradBiasMemory = memory(
-          {{{mBiasDims}, dataType, formatBias}, mkldnnEngineBwd},
+          {{mBiasDims}, dataType, formatBias},
+          mkldnnEngineBwd,
           biasRawBackwards.get());
+
+      std::unordered_map<int, dnnl::memory> input_args;
+      bwdWeights =
+          std::make_shared<convolution_backward_weights>(*bwdWeightPrimDesc);
+      input_args.insert({DNNL_ARG_SRC, inputMemoryBackwards});
+      input_args.insert({DNNL_ARG_DIFF_DST, gradOutputMemory});
+      input_args.insert({DNNL_ARG_DIFF_WEIGHTS, gradWeightsMemory});
+
       if (hasBias) {
-        bwdWeights = std::make_shared<convolution_backward_weights>(
-            *bwdWeightPrimDesc,
-            inputMemoryBackwards,
-            gradOutputMemory,
-            gradWeightsMemory,
-            gradBiasMemory);
-      } else {
-        bwdWeights = std::make_shared<convolution_backward_weights>(
-            *bwdWeightPrimDesc,
-            inputMemoryBackwards,
-            gradOutputMemory,
-            gradWeightsMemory);
+        input_args.insert({DNNL_ARG_DIFF_BIAS, gradBiasMemory});
       }
       networkBackwards.push_back(*bwdWeights);
 
       // Reorder weight gradients if necessary
-      if (gradWeightsMemory != gradWeightsMemoryInit) {
+      if (gradWeightsMemory.get_desc() != gradWeightsMemoryInit.get_desc()) {
         networkBackwards.push_back(
-            mkldnn::reorder(gradWeightsMemory, gradWeightsMemoryInit));
+            dnnl::reorder(gradWeightsMemory, gradWeightsMemoryInit));
       }
 
-      detail::MkldnnStream::getInstance().getStream().submit(networkBackwards);
+      for (size_t i = 0; i < networkBackwards.size(); ++i) {
+        networkBackwards.at(i).execute(
+            detail::MkldnnStream::getInstance().getStream(), input_args);
+      }
 
       // Add weight and bias gradients
       weightRef.addGrad(gradWeights);

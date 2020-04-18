@@ -13,7 +13,7 @@
 namespace fl {
 namespace detail {
 
-mkldnn::stream& MkldnnStream::getStream() {
+dnnl::stream& MkldnnStream::getStream() {
   return stream_;
 }
 
@@ -22,7 +22,7 @@ MkldnnStream& MkldnnStream::getInstance() {
   return instance;
 }
 
-mkldnn::engine& MkldnnEngine::getEngine() {
+dnnl::engine& MkldnnEngine::getEngine() {
   return engine_;
 }
 
@@ -31,33 +31,33 @@ MkldnnEngine& MkldnnEngine::getInstance() {
   return instance;
 }
 
-mkldnn::memory::dims convertAfToMklDnnDims(const std::vector<dim_t>& afDims) {
+dnnl::memory::dims convertAfToMklDnnDims(const std::vector<dim_t>& afDims) {
   // MKL-DNN uses ints in dims
-  std::vector<int> intVec(afDims.begin(), afDims.end());
-  return mkldnn::memory::dims(intVec);
+  std::vector<dnnl::memory::dim> intVec(afDims.begin(), afDims.end());
+  return dnnl::memory::dims(intVec);
 }
 
-mkldnn::memory mkldnnAlignOrdering(
-    std::vector<mkldnn::primitive>& net,
-    const mkldnn::memory& memory,
-    const mkldnn::memory::primitive_desc& desc) {
+dnnl::memory mkldnnAlignOrdering(
+    std::vector<dnnl::primitive>& net,
+    const dnnl::memory& memory,
+    const dnnl::memory::desc& desc) {
   auto memoryOut = memory;
-  if (memory.get_primitive_desc() != mkldnn::memory::primitive_desc(desc)) {
+  if (memory.get_desc() != desc) {
     memoryOut =
-        mkldnn::memory(desc); // use the ordering requested by the descriptor
-    net.push_back(mkldnn::reorder(memory, memoryOut));
+        dnnl::memory(desc, fl::detail::MkldnnEngine::getInstance().getEngine()); // use the ordering requested by the descriptor
+    net.push_back(dnnl::reorder(memory, memoryOut));
   }
   return memoryOut;
 }
 
-mkldnn::algorithm mkldnnMapToPoolingMode(const PoolingMode mode) {
+dnnl::algorithm mkldnnMapToPoolingMode(const PoolingMode mode) {
   switch (mode) {
     case PoolingMode::MAX:
-      return mkldnn::pooling_max;
+      return dnnl::algorithm::pooling_max;
     case PoolingMode::AVG_INCLUDE_PADDING:
-      return mkldnn::pooling_avg_include_padding;
+      return dnnl::algorithm::pooling_avg_include_padding;
     case PoolingMode::AVG_EXCLUDE_PADDING:
-      return mkldnn::pooling_avg_exclude_padding;
+      return dnnl::algorithm::pooling_avg_exclude_padding;
     default:
       throw std::invalid_argument("unsupported pooling mode for cuDNN");
   }
