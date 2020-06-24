@@ -22,7 +22,7 @@ endif()
 # Find headers
 find_path(
   MKLDNN_INCLUDE_DIR
-  mkldnn.hpp mkldnn.h
+  dnnl.hpp dnnl.h
   PATHS
   ${MKLDNN_ROOT}
   PATH_SUFFIXES
@@ -40,7 +40,7 @@ endif()
 # Find library
 find_library(
   MKLDNN_LIBRARY
-  mkldnn
+  dnnl
   PATHS
   ${MKLDNN_ROOT}
   PATH_SUFFIXES
