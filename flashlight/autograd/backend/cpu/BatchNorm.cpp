@@ -35,8 +35,8 @@ Variable batchnorm(
     const Variable& input,
     const Variable& weight,
     const Variable& bias,
-    Variable& running_mean,
-    Variable& running_var,
+    Variable& runningMean,
+    Variable& runningVar,
     const std::vector<int>& axes,
     bool train,
     double epsilon) {
@@ -47,12 +47,12 @@ Variable batchnorm(
     nfeatures *= input.dims(ax);
   }
 
-  if (running_var.isempty()) {
-    running_var = Variable(af::constant(1.0, nfeatures, input.type()), false);
+  if (runningVar.isempty()) {
+    runningVar = Variable(af::constant(1.0, nfeatures, input.type()), false);
   }
 
-  if (running_mean.isempty()) {
-    running_mean = Variable(af::constant(0.0, nfeatures, input.type()), false);
+  if (runningMean.isempty()) {
+    runningMean = Variable(af::constant(0.0, nfeatures, input.type()), false);
   }
 
   // Check if axes is valid
@@ -141,14 +141,14 @@ Variable batchnorm(
   auto outputMem = dnnl::memory(outputMemDesc, mkldnnEngine, outputRaw.get());
 
   // mean
-  DevicePtr meanRaw(running_mean.array());
-  auto meanDims = detail::convertAfToMklDnnDims({running_mean.dims(0)});
+  DevicePtr meanRaw(runningMean.array());
+  auto meanDims = detail::convertAfToMklDnnDims({runningMean.dims(0)});
   auto meanMemDesc = dnnl::memory::desc({meanDims}, dType, formatX);
   auto meanMemInit = dnnl::memory(meanMemDesc, mkldnnEngine, meanRaw.get());
 
   // var
-  DevicePtr varRaw(running_var.array());
-  auto varDims = detail::convertAfToMklDnnDims({running_var.dims(0)});
+  DevicePtr varRaw(runningVar.array());
+  auto varDims = detail::convertAfToMklDnnDims({runningVar.dims(0)});
   auto varMemDesc = dnnl::memory::desc({varDims}, dType, formatX);
   auto varMemInit = dnnl::memory(varMemDesc, mkldnnEngine, varRaw.get());
 
@@ -310,8 +310,8 @@ Variable batchnorm(
     const Variable& input,
     const Variable& weight,
     const Variable& bias,
-    Variable& running_mean,
-    Variable& running_var,
+    Variable& runningMean,
+    Variable& runningVar,
     const std::vector<int>& axes,
     bool train,
     double momentum,
@@ -320,7 +320,7 @@ Variable batchnorm(
   // If momentum enabled, throw error.
   if (momentum == 0.0) {
     return batchnorm(
-        input, weight, bias, running_mean, running_var, axes, train, epsilon);
+        input, weight, bias, runningMean, runningVar, axes, train, epsilon);
   } else {
     throw std::runtime_error("BatchNorm CPU backend doesn't support momentum.");
   }

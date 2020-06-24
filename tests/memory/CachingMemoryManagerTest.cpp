@@ -16,10 +16,8 @@
 #include <gtest/gtest.h>
 
 #include "flashlight/common/CppBackports.h"
-#include "flashlight/common/Logging.h"
 #include "flashlight/memory/memory.h"
 
-using namespace fl;
 
 class CachingMemoryManagerTest : public ::testing::Test {
  protected:
@@ -117,6 +115,27 @@ TEST_F(CachingMemoryManagerTest, LargeNumberOfAllocs) {
     std::vector<int> dims(4);
     dimsArr.as(af::dtype::s32).host(dims.data());
     EXPECT_NO_THROW(a = af::array(dims[0], dims[1], dims[2], dims[3]));
+  }
+}
+
+TEST_F(CachingMemoryManagerTest, OOM) {
+  af_backend b;
+  af_get_active_backend(&b);
+  // Despite that test is trying to allocate PB of memory,
+  // depending on the drivers, afopencl does not seem to guarantee to send an OOM signal.
+  // https://github.com/arrayfire/arrayfire/issues/2650
+  // At the moment, skipping afopencl.
+  if (b == AF_BACKEND_OPENCL)
+    GTEST_SKIP();
+  af::array a;
+  // N^3 tensor means about 3PB: expected to OOM on today's cuda GPU.
+  const unsigned N = 99999;
+  try {
+    a = af::randu({N, N, N}, f32);
+  } catch(af::exception& ex) {
+    ASSERT_EQ(ex.err(), AF_ERR_NO_MEM);
+  } catch(...) {
+    EXPECT_TRUE(false) << "CachingMemoryManagerTest OOM: unexpected exception";
   }
 }
 
